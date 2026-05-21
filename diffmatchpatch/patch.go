@@ -16,7 +16,30 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
+
+// alignRuneStart 把 byte index idx 退回到最近的 UTF-8 rune start byte。
+// idx == 0 或 idx >= len(s) 时原样返回。
+//
+// 动机: Google JS diff-match-patch 用 string.substring (UTF-16 code unit) 切,
+// surrogate pair 中间切是 well-defined。sergi PatchApply / PatchSplitMax 直接
+// 用 byte slice (text[a:b]) 切, 一旦 MatchMain Bitap 返回的 byte position 落在
+// 多字节字符 (中文 3B / em dash 3B / emoji 4B) 中间, 切出来的是 invalid UTF-8,
+// 后续 MatchMain 找 anchor 漏位置, slice index 越界 panic (issue #132)。
+//
+// 修法: 所有 byte slice 切点先 alignRuneStart 退回到最近合法 rune boundary。
+// 等价于"少切 1-3 字节", 但保证 slice 出来始终是 valid UTF-8 string,
+// 后续 DiffMain / MatchMain 不会再因 invalid UTF-8 漏 / 越界。
+func alignRuneStart(s string, idx int) int {
+	if idx <= 0 || idx >= len(s) {
+		return idx
+	}
+	for idx > 0 && !utf8.RuneStart(s[idx]) {
+		idx--
+	}
+	return idx
+}
 
 // Patch represents one patch operation.
 type Patch struct {
@@ -91,12 +114,16 @@ func (dmp *DiffMatchPatch) PatchAddContext(patch Patch, text string) Patch {
 	padding += dmp.PatchMargin
 
 	// Add the prefix.
-	prefix := text[max(0, patch.Start2-padding):patch.Start2]
+	// rune-safety: prefix 起点 align 到 rune boundary,避免切到多字节字符中间产 invalid UTF-8。
+	prefixStart := alignRuneStart(text, max(0, patch.Start2-padding))
+	prefix := text[prefixStart:patch.Start2]
 	if len(prefix) != 0 {
 		patch.diffs = append([]Diff{Diff{DiffEqual, prefix}}, patch.diffs...)
 	}
 	// Add the suffix.
-	suffix := text[patch.Start2+patch.Length1 : min(len(text), patch.Start2+patch.Length1+padding)]
+	// rune-safety: suffix 终点 align 到 rune boundary。
+	suffixEnd := alignRuneStart(text, min(len(text), patch.Start2+patch.Length1+padding))
+	suffix := text[patch.Start2+patch.Length1 : suffixEnd]
 	if len(suffix) != 0 {
 		patch.diffs = append(patch.diffs, Diff{DiffEqual, suffix})
 	}
@@ -229,10 +256,24 @@ func (dmp *DiffMatchPatch) PatchDeepCopy(patches []Patch) []Patch {
 }
 
 // PatchApply merges a set of patches onto the text.  Returns a patched text, as well as an array of true/false values indicating which patches were applied.
-func (dmp *DiffMatchPatch) PatchApply(patches []Patch, text string) (string, []bool) {
+func (dmp *DiffMatchPatch) PatchApply(patches []Patch, text string) (out string, results []bool) {
+	out = text
 	if len(patches) == 0 {
-		return text, []bool{}
+		results = []bool{}
+		return
 	}
+	// 预 init 跟原 sergi 行为对齐 (caller 拿 len(results) 跟 input patches 数对应);
+	// PatchSplitMax 后会重新分配 (split 可能增加段数)。
+	results = make([]bool, len(patches))
+
+	// fork-only safety net: 残余 panic (sergi 内部 byte-slice 漂移导致 index out of range
+	// issue #132) 不让进程崩；保持 results 为 [false...] 让调用方走 422 路径而不是 500。
+	// 跟原 sergi v1.4.0 行为差异: 原版让 panic propagate 给上层 recover。
+	defer func() {
+		if r := recover(); r != nil {
+			_ = r // swallow; results 已是 [false...]
+		}
+	}()
 
 	// Deep copy the patches so that no changes are made to originals.
 	patches = dmp.PatchDeepCopy(patches)
@@ -244,7 +285,7 @@ func (dmp *DiffMatchPatch) PatchApply(patches []Patch, text string) (string, []b
 	x := 0
 	// delta keeps track of the offset between the expected and actual location of the previous patch.  If there are patches expected at positions 10 and 20, but the first patch was found at 12, delta is 2 and the second patch has an effective expected position of 22.
 	delta := 0
-	results := make([]bool, len(patches))
+	results = make([]bool, len(patches))
 	for _, aPatch := range patches {
 		expectedLoc := aPatch.Start2 + delta
 		text1 := dmp.DiffText1(aPatch.diffs)
@@ -264,6 +305,12 @@ func (dmp *DiffMatchPatch) PatchApply(patches []Patch, text string) (string, []b
 		} else {
 			startLoc = dmp.MatchMain(text, text1, expectedLoc)
 		}
+		// rune-safety: Bitap 算出来的 byte position 可能落在多字节字符中间。
+		// 退到最近 rune start 保证后续 text[startLoc:...] / text[:startLoc] 不会
+		// 切出 invalid UTF-8 (panic 根因)。
+		if startLoc != -1 {
+			startLoc = alignRuneStart(text, startLoc)
+		}
 		if startLoc == -1 {
 			// No match found.  :(
 			results[x] = false
@@ -274,14 +321,18 @@ func (dmp *DiffMatchPatch) PatchApply(patches []Patch, text string) (string, []b
 			results[x] = true
 			delta = startLoc - expectedLoc
 			var text2 string
+			var text2End int
 			if endLoc == -1 {
-				text2 = text[startLoc:int(math.Min(float64(startLoc+len(text1)), float64(len(text))))]
+				text2End = alignRuneStart(text, int(math.Min(float64(startLoc+len(text1)), float64(len(text)))))
 			} else {
-				text2 = text[startLoc:int(math.Min(float64(endLoc+dmp.MatchMaxBits), float64(len(text))))]
+				endLoc = alignRuneStart(text, endLoc)
+				text2End = alignRuneStart(text, int(math.Min(float64(endLoc+dmp.MatchMaxBits), float64(len(text)))))
 			}
+			text2 = text[startLoc:text2End]
 			if text1 == text2 {
 				// Perfect match, just shove the Replacement text in.
-				text = text[:startLoc] + dmp.DiffText2(aPatch.diffs) + text[startLoc+len(text1):]
+				replaceEnd := alignRuneStart(text, startLoc+len(text1))
+				text = text[:startLoc] + dmp.DiffText2(aPatch.diffs) + text[replaceEnd:]
 			} else {
 				// Imperfect match.  Run a diff to get a framework of equivalent indices.
 				diffs := dmp.DiffMain(text1, text2, false)
@@ -296,12 +347,16 @@ func (dmp *DiffMatchPatch) PatchApply(patches []Patch, text string) (string, []b
 							index2 := dmp.DiffXIndex(diffs, index1)
 							if aDiff.Type == DiffInsert {
 								// Insertion
-								text = text[:startLoc+index2] + aDiff.Text + text[startLoc+index2:]
+								insertAt := alignRuneStart(text, startLoc+index2)
+								text = text[:insertAt] + aDiff.Text + text[insertAt:]
 							} else if aDiff.Type == DiffDelete {
 								// Deletion
-								startIndex := startLoc + index2
-								text = text[:startIndex] +
-									text[startIndex+dmp.DiffXIndex(diffs, index1+len(aDiff.Text))-index2:]
+								startIndex := alignRuneStart(text, startLoc+index2)
+								endIndex := alignRuneStart(text, startLoc+dmp.DiffXIndex(diffs, index1+len(aDiff.Text)))
+								if endIndex < startIndex {
+									endIndex = startIndex
+								}
+								text = text[:startIndex] + text[endIndex:]
 							}
 						}
 						if aDiff.Type != DiffDelete {
@@ -315,7 +370,8 @@ func (dmp *DiffMatchPatch) PatchApply(patches []Patch, text string) (string, []b
 	}
 	// Strip the padding off.
 	text = text[len(nullPadding) : len(nullPadding)+(len(text)-2*len(nullPadding))]
-	return text, results
+	out = text
+	return
 }
 
 // PatchAddPadding adds some padding on text start and end so that edges can match something.
@@ -416,7 +472,17 @@ func (dmp *DiffMatchPatch) PatchSplitMax(patches []Patch) []Patch {
 					bigpatch.diffs = bigpatch.diffs[1:]
 				} else {
 					// Deletion or equality.  Only take as much as we can stomach.
-					diffText = diffText[:min(len(diffText), patchSize-patch.Length1-dmp.PatchMargin)]
+					// rune-safety: 切 diffText 时退到最近 rune boundary 避免切到
+					// 多字节字符中间产 invalid UTF-8 (panic 根因)。
+					cutAt := min(len(diffText), patchSize-patch.Length1-dmp.PatchMargin)
+					cutAt = alignRuneStart(diffText, cutAt)
+					// 死循环防护: cutAt == 0 且 diffText 非空时,前进一个完整 rune,
+					// 保证至少消耗 1 字符 (否则外层 for 永远不退出)。
+					if cutAt == 0 && len(diffText) > 0 {
+						_, size := utf8.DecodeRuneInString(diffText)
+						cutAt = size
+					}
+					diffText = diffText[:cutAt]
 
 					patch.Length1 += len(diffText)
 					Start1 += len(diffText)
@@ -430,21 +496,26 @@ func (dmp *DiffMatchPatch) PatchSplitMax(patches []Patch) []Patch {
 					if diffText == bigpatch.diffs[0].Text {
 						bigpatch.diffs = bigpatch.diffs[1:]
 					} else {
-						bigpatch.diffs[0].Text =
-							bigpatch.diffs[0].Text[len(diffText):]
+						// rune-safety: len(diffText) 已 align,通常已是 rune boundary;
+						// 再 align 一次兜底应对 cutAt == 0 等边界 case。
+						remStart := alignRuneStart(bigpatch.diffs[0].Text, len(diffText))
+						bigpatch.diffs[0].Text = bigpatch.diffs[0].Text[remStart:]
 					}
 				}
 			}
 			// Compute the head context for the next patch.
 			precontext = dmp.DiffText2(patch.diffs)
-			precontext = precontext[max(0, len(precontext)-dmp.PatchMargin):]
+			// rune-safety: 退到最近 rune boundary,避免 precontext 起点落在 multi-byte 中间。
+			precontext = precontext[alignRuneStart(precontext, max(0, len(precontext)-dmp.PatchMargin)):]
 
 			postcontext := ""
 			// Append the end context for this patch.
-			if len(dmp.DiffText1(bigpatch.diffs)) > dmp.PatchMargin {
-				postcontext = dmp.DiffText1(bigpatch.diffs)[:dmp.PatchMargin]
+			rawPost := dmp.DiffText1(bigpatch.diffs)
+			if len(rawPost) > dmp.PatchMargin {
+				// rune-safety: 切前 align,避免切到 multi-byte 中间。
+				postcontext = rawPost[:alignRuneStart(rawPost, dmp.PatchMargin)]
 			} else {
-				postcontext = dmp.DiffText1(bigpatch.diffs)
+				postcontext = rawPost
 			}
 
 			if len(postcontext) != 0 {
