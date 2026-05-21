@@ -1,4 +1,4 @@
-module github.com/sergi/go-diff
+module github.com/SnowWarri0r/go-diff
 
 require (
 	github.com/davecgh/go-spew v1.1.1 // indirect
