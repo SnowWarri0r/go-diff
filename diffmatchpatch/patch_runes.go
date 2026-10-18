@@ -1,5 +1,5 @@
 // Copyright (c) 2012-2016 The go-diff authors. All rights reserved.
-// Lovart fork extension: rune-based Patch{Apply,SplitMax,AddPadding} +
+// Fork extension: rune-based Patch{Apply,SplitMax,AddPadding} +
 // helpers — mirrors original Patch* but counts length / slices by rune index
 // instead of UTF-8 byte. See match_runes.go header for motivation.
 //
