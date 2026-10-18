@@ -1,5 +1,5 @@
 // Copyright (c) 2012-2016 The go-diff authors. All rights reserved.
-// Lovart fork extension: rune-based Match — mirrors MatchMain/MatchBitap/MatchAlphabet
+// Fork extension: rune-based Match — mirrors MatchMain/MatchBitap/MatchAlphabet
 // but operates on []rune instead of UTF-8 bytes, so position/length math aligns
 // with Google JS DMP (UTF-16 code unit ≈ rune for BMP characters).
 //
