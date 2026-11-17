@@ -267,7 +267,11 @@ func (dmp *DiffMatchPatch) PatchApplyRunes(patches []Patch, text []rune) (out []
 	results = make([]bool, len(patches))
 	defer func() {
 		if r := recover(); r != nil {
-			_ = r
+			// out 仍是入参原文，所以每一段都要报失败；否则 panic 前已置 true 的段会让
+			// 调用方以为补丁打上了，修改被静默丢掉。
+			for i := range results {
+				results[i] = false
+			}
 		}
 	}()
 
@@ -353,6 +357,10 @@ func (dmp *DiffMatchPatch) PatchApplyRunes(patches []Patch, text []rune) (out []
 								endIdx := startLoc + dmp.DiffXIndexRunes(diffs, index1+delLen)
 								if startIdx < 0 {
 									startIdx = 0
+								}
+								// 前面的编辑可能已把 text 缩短到 startIdx 以下（与 JS substring 一样钳到末尾）
+								if startIdx > len(text) {
+									startIdx = len(text)
 								}
 								if endIdx > len(text) {
 									endIdx = len(text)

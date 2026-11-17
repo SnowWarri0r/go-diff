@@ -88,3 +88,21 @@ func TestDiffXIndexRunes_CountsRunes(t *testing.T) {
 		t.Errorf("DiffXIndexRunes(loc=3) = %d, want 3 (rune-aligned prefix length)", got)
 	}
 }
+
+// base 已漂移时，补丁里靠后的删除可能算出超过当前 text 长度的起点。
+// 期望值取自 JS diff-match-patch 对同一补丁、同一文本的 patch_apply 结果
+// （JS 这里也会留下一个填充字符 \x01）。
+func TestPatchApplyRunes_DeleteStartPastEnd(t *testing.T) {
+	dmp := New()
+	patches, err := dmp.PatchFromText("@@ -1,8 +1,4 @@\n b\n-%0Aaaa\n cc\n-x\n+b\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, results := dmp.PatchApplyRunes(patches, []rune("ab\nc b\naa"))
+	if got := string(out); got != "ab\x01" {
+		t.Errorf("out = %q, want %q", got, "ab\x01")
+	}
+	if len(results) != 1 || !results[0] {
+		t.Errorf("results = %v, want [true]", results)
+	}
+}
